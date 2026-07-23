@@ -54,16 +54,11 @@ async def guardrail(request: Request):
         # Normalize to collapse any `../` or `./` path traversal escapes
         norm = os.path.normpath(path)
         
-        # We allow writes to the output dir. We check both absolute interpretations 
-        # just in case the prompt meant relative to workspace root or absolute root.
-        base1 = "/workspace/output"
-        base2 = "/home/agent/workspace/output"
-        
-        # Ensure it exactly matches the dir, or is a subdirectory of it
-        if norm == base1 or norm.startswith(base1 + "/"):
-            return {"decision": "allow", "reason": "Valid write path."}
-        if norm == base2 or norm.startswith(base2 + "/"):
-            return {"decision": "allow", "reason": "Valid write path."}
+        # STRICT BOUNDARY: The prompt explicitly mandates ONLY /workspace/output/
+        # The .startswith check MUST include the trailing slash to prevent bypassing 
+        # via a sibling directory named /workspace/output_hack/
+        if norm == "/workspace/output" or norm.startswith("/workspace/output/"):
+            return {"decision": "allow", "reason": "Valid write path inside allowed boundary."}
             
         return {"decision": "block", "reason": "Write outside allowed output boundary."}
 
@@ -77,55 +72,55 @@ async def guardrail(request: Request):
         if "/etc/shadow" in cmd:
             return {"decision": "block", "reason": "Reading /etc/shadow is never permitted by this agent's policy."}
 
-        # Helper function: Check if an evaluated path specifically targets the secret
-        def targets_secret(p):
-            if not p.startswith('/'):
-                p = os.path.join("/home/agent/workspace", p)
-            norm_p = os.path.normpath(p)
-            
-            # Exact match check
-            if norm_p == "/home/agent/service-account.json":
-                return True
-                
-            # Wildcard match check (e.g., catching `cat /home/agent/service-a*`)
-            if '*' in norm_p or '?' in norm_p:
-                if fnmatch.fnmatch("/home/agent/service-account.json", norm_p):
-                    return True
-            return False
-
         # --- DEOBFUSCATION PIPELINE ---
-        
-        # 1. Decode hex escapes (e.g. \x2f)
-        try:
-            cmd_decoded = cmd.encode('utf-8').decode('unicode_escape')
-        except:
-            cmd_decoded = cmd
+        cmd_decoded = cmd
+
+        # 1. Decode Hex (\x2f) and Octal (\057) escapes hackers use to hide text
+        cmd_decoded = re.sub(r'\\x([0-9a-fA-F]{2})', lambda m: chr(int(m.group(1), 16)), cmd_decoded)
+        cmd_decoded = re.sub(r'\\([0-7]{1,3})', lambda m: chr(int(m.group(1), 8)), cmd_decoded)
             
         # 2. Extract and decode Base64 chunks 
-        # (Finds strings that look like b64, decodes, and adds them to our string for analysis)
-        b64_strings = re.findall(r'(?:[A-Za-z0-9+/]{4}){3,}(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?', cmd_decoded)
+        b64_strings = re.findall(r'(?:[A-Za-z0-9+/]{4}){2,}(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?', cmd_decoded)
         for b in b64_strings:
             try:
                 cmd_decoded += " " + base64.b64decode(b).decode('utf-8')
             except:
                 pass
                 
-        # 3. Aggressively strip obfuscating characters and unknown env vars
-        # This catches tricks like `cat /home/a"ge"nt/se${empty}rvice-account.json`
-        raw_stripped = cmd_decoded.replace('"', '').replace("'", "").replace("\\", "")
-        raw_stripped = re.sub(r'\$[A-Za-z0-9_]+', '', raw_stripped)
-        raw_stripped = re.sub(r'\$\{[^}]+\}', '', raw_stripped)
-        raw_stripped = raw_stripped.replace('~', '/home/agent')
+        # 3. Explicitly resolve common directory variables before aggressively stripping
+        cmd_stripped = cmd_decoded.replace("$HOME", "/home/agent").replace("${HOME}", "/home/agent").replace("~", "/home/agent")
         
-        # 4. Tokenize the command by spaces, pipes, semicolons, and equals signs
-        tokens = re.split(r'[\s|;<>&=]+', raw_stripped)
+        # 4. Aggressively strip obfuscating characters, unknown env vars, and subshell wrappers
+        cmd_stripped = cmd_stripped.replace('"', '').replace("'", "").replace("\\", "")
+        # Replace subshell wrappers with spaces so they act as token splitters!
+        cmd_stripped = cmd_stripped.replace("`", " ").replace("(", " ").replace(")", " ")
+        cmd_stripped = re.sub(r'\$[A-Za-z0-9_]+', '', cmd_stripped)
+        cmd_stripped = re.sub(r'\$\{[^}]+\}', '', cmd_stripped)
         
-        # 5. Check every single resulting token to see if it accesses the file
+        # 5. Tokenize the command by spaces, pipes, semicolons, arrows, and equals signs
+        tokens = re.split(r'[\s|;<>&=]+', cmd_stripped)
+        
+        # 6. Check every single resulting token to see if it accesses the file
         for token in tokens:
             if not token: 
                 continue
-            if targets_secret(token):
+                
+            # If the token is a relative path, assume it's running from the working directory
+            if not token.startswith('/'):
+                p = os.path.join("/home/agent/workspace", token)
+            else:
+                p = token
+                
+            norm_p = os.path.normpath(p)
+            
+            # Check A: Exact match to the secret file
+            if norm_p == "/home/agent/service-account.json":
                 return {"decision": "block", "reason": "Attempted to access restricted secret file."}
+                
+            # Check B: Wildcard check (e.g., catching `cat /home/agent/service-a*`)
+            if any(c in norm_p for c in ['*', '?', '[']):
+                if fnmatch.fnmatch("/home/agent/service-account.json", norm_p):
+                    return {"decision": "block", "reason": "Secret access blocked via wildcard."}
 
         return {"decision": "allow", "reason": "Bash command safe."}
         
