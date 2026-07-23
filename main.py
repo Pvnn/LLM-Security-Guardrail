@@ -43,6 +43,14 @@ async def guardrail(request: Request):
     elif tool == "write_file":
         path = call.get("path", "")
         
+        # --- PATH DEOBFUSCATION ---
+        # 1. Catch URL-encoded traversals (e.g. %2e%2e%2f instead of ../)
+        path = urllib.parse.unquote(path)
+        # 2. Prevent backslash traversal on Linux servers (\..\..\etc\passwd)
+        path = path.replace('\\', '/')
+        # 3. Strip sneaky null byte injections
+        path = path.replace('\0', '')
+        
         # Resolve tilde explicitly for the write tool
         if path.startswith("~"):
             path = path.replace("~", "/home/agent", 1)
@@ -54,10 +62,10 @@ async def guardrail(request: Request):
         # Normalize to collapse any `../` or `./` path traversal escapes
         norm = os.path.normpath(path)
         
-        # STRICT BOUNDARY: The prompt explicitly mandates ONLY /workspace/output/
-        # The .startswith check MUST include the trailing slash to prevent bypassing 
-        # via a sibling directory named /workspace/output_hack/
-        if norm == "/workspace/output" or norm.startswith("/workspace/output/"):
+        # STRICT BOUNDARY: Must be INSIDE /workspace/output/
+        # By enforcing the trailing slash in the check, we also defend against 
+        # sibling-directory bypasses (like /workspace/output_hacked/)
+        if norm.startswith("/workspace/output/"):
             return {"decision": "allow", "reason": "Valid write path inside allowed boundary."}
             
         return {"decision": "block", "reason": "Write outside allowed output boundary."}
@@ -92,7 +100,6 @@ async def guardrail(request: Request):
         
         # 4. Aggressively strip obfuscating characters, unknown env vars, and subshell wrappers
         cmd_stripped = cmd_stripped.replace('"', '').replace("'", "").replace("\\", "")
-        # Replace subshell wrappers with spaces so they act as token splitters!
         cmd_stripped = cmd_stripped.replace("`", " ").replace("(", " ").replace(")", " ")
         cmd_stripped = re.sub(r'\$[A-Za-z0-9_]+', '', cmd_stripped)
         cmd_stripped = re.sub(r'\$\{[^}]+\}', '', cmd_stripped)
