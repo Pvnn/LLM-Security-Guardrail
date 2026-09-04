@@ -5,6 +5,15 @@ import re
 import base64
 import fnmatch
 
+# --- Configuration ---
+# You can override these using environment variables
+ALLOWED_HOSTS = os.getenv("ALLOWED_HOSTS", "pypi.org,huggingface.co").split(",")
+HOME_DIR = os.getenv("HOME_DIR", "/home/agent")
+WORKSPACE_DIR = os.getenv("WORKSPACE_DIR", os.path.join(HOME_DIR, "workspace"))
+ALLOWED_OUTPUT_DIR = os.getenv("ALLOWED_OUTPUT_DIR", "/workspace/output/")
+RESTRICTED_FILES = os.getenv("RESTRICTED_FILES", os.path.join(HOME_DIR, "service-account.json")).split(",")
+# ---------------------
+
 app = FastAPI()
 
 @app.post("/")
@@ -22,7 +31,7 @@ async def guardrail(request: Request):
     if tool == "http_request":
         url = call.get("url", "")
         
-        # Defend against backslash confusion (http://pypi.org\attacker.com)
+        # Defend against backslash confusion (e.g., http://allowed.com\attacker.com)
         url = url.replace('\\', '/')
         try:
             parsed = urllib.parse.urlparse(url)
@@ -32,7 +41,7 @@ async def guardrail(request: Request):
         except:
             host = ""
             
-        if host in ["pypi.org", "huggingface.co"]:
+        if host in ALLOWED_HOSTS:
             return {"decision": "allow", "reason": "Host strictly matched allowlist."}
         else:
             return {"decision": "block", "reason": "Host not in allowlist or spoofed."}
@@ -53,19 +62,19 @@ async def guardrail(request: Request):
         
         # Resolve tilde explicitly for the write tool
         if path.startswith("~"):
-            path = path.replace("~", "/home/agent", 1)
+            path = path.replace("~", HOME_DIR, 1)
             
         # If relative, anchor it to the agent's workspace
         if not path.startswith('/'):
-            path = os.path.join("/home/agent/workspace", path)
+            path = os.path.join(WORKSPACE_DIR, path)
             
         # Normalize to collapse any `../` or `./` path traversal escapes
         norm = os.path.normpath(path)
         
-        # STRICT BOUNDARY: Must be INSIDE /workspace/output/
+        # STRICT BOUNDARY: Must be INSIDE allowed output directory
         # By enforcing the trailing slash in the check, we also defend against 
         # sibling-directory bypasses (like /workspace/output_hacked/)
-        if norm.startswith("/workspace/output/"):
+        if norm.startswith(ALLOWED_OUTPUT_DIR):
             return {"decision": "allow", "reason": "Valid write path inside allowed boundary."}
             
         return {"decision": "block", "reason": "Write outside allowed output boundary."}
@@ -76,9 +85,9 @@ async def guardrail(request: Request):
     elif tool == "bash":
         cmd = call.get("command", "")
         
-        # Catch the prompt's worked example exactly
+        # Block reading of sensitive system files
         if "/etc/shadow" in cmd:
-            return {"decision": "block", "reason": "Reading /etc/shadow is never permitted by this agent's policy."}
+            return {"decision": "block", "reason": "Reading /etc/shadow is never permitted by policy."}
 
         # --- DEOBFUSCATION PIPELINE ---
         cmd_decoded = cmd
@@ -96,7 +105,7 @@ async def guardrail(request: Request):
                 pass
                 
         # 3. Explicitly resolve common directory variables before aggressively stripping
-        cmd_stripped = cmd_decoded.replace("$HOME", "/home/agent").replace("${HOME}", "/home/agent").replace("~", "/home/agent")
+        cmd_stripped = cmd_decoded.replace("$HOME", HOME_DIR).replace("${HOME}", HOME_DIR).replace("~", HOME_DIR)
         
         # 4. Aggressively strip obfuscating characters, unknown env vars, and subshell wrappers
         cmd_stripped = cmd_stripped.replace('"', '').replace("'", "").replace("\\", "")
@@ -107,27 +116,28 @@ async def guardrail(request: Request):
         # 5. Tokenize the command by spaces, pipes, semicolons, arrows, and equals signs
         tokens = re.split(r'[\s|;<>&=]+', cmd_stripped)
         
-        # 6. Check every single resulting token to see if it accesses the file
+        # 6. Check every single resulting token to see if it accesses a restricted file
         for token in tokens:
             if not token: 
                 continue
                 
             # If the token is a relative path, assume it's running from the working directory
             if not token.startswith('/'):
-                p = os.path.join("/home/agent/workspace", token)
+                p = os.path.join(WORKSPACE_DIR, token)
             else:
                 p = token
                 
             norm_p = os.path.normpath(p)
             
-            # Check A: Exact match to the secret file
-            if norm_p == "/home/agent/service-account.json":
-                return {"decision": "block", "reason": "Attempted to access restricted secret file."}
-                
-            # Check B: Wildcard check (e.g., catching `cat /home/agent/service-a*`)
-            if any(c in norm_p for c in ['*', '?', '[']):
-                if fnmatch.fnmatch("/home/agent/service-account.json", norm_p):
-                    return {"decision": "block", "reason": "Secret access blocked via wildcard."}
+            for restricted_file in RESTRICTED_FILES:
+                # Check A: Exact match to the restricted file
+                if norm_p == restricted_file:
+                    return {"decision": "block", "reason": "Attempted to access restricted file."}
+                    
+                # Check B: Wildcard check
+                if any(c in norm_p for c in ['*', '?', '[']):
+                    if fnmatch.fnmatch(restricted_file, norm_p):
+                        return {"decision": "block", "reason": "Restricted file access blocked via wildcard."}
 
         return {"decision": "allow", "reason": "Bash command safe."}
         
